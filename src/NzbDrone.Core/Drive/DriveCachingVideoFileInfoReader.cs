@@ -6,15 +6,22 @@ using NzbDrone.Core.MediaFiles.MediaInfo;
 
 namespace NzbDrone.Core.Drive
 {
-    // Decorates IVideoFileInfoReader. For a Drive-backed file (immutable R/O branch) the full
-    // ffprobe result is cached in the index keyed by the Drive file ID, so a given file is
-    // probed at most once ever — even across app-DB resets. GetRunTime is served for free from
-    // Drive's videoMediaMetadata duration when present. Local-branch files pass straight
-    // through (ffprobe on real local disk is already fast).
+    // Decorates IVideoFileInfoReader so the arrs NEVER touch the rclone FUSE mount for a
+    // Drive-backed file. Mediainfo is:
+    //   1. served from the index probe_cache if already probed (probe-once, immutable branch);
+    //   2. otherwise probed by pulling the file HEADER straight from the Drive API (by file
+    //      ID, no FUSE) into a temp file and ffprobing that — full-download fallback for
+    //      containers whose metadata isn't in the first chunk (e.g. mp4 moov-at-end);
+    //   3. cached by Drive file ID forever (schema-revision invalidated).
+    // Runtime comes free from Drive videoMediaMetadata when present. Local-branch files pass
+    // straight through (ffprobe on real local disk is fine and never involves FUSE).
     public class DriveCachingVideoFileInfoReader : IVideoFileInfoReader
     {
+        private const long HeaderBytes = 32L * 1024 * 1024;   // 32 MiB is enough for almost all headers
+
         private readonly IVideoFileInfoReader _inner;
         private readonly IDriveIndex _index;
+        private readonly IDriveClient _driveClient;
         private readonly IDriveConfigService _configService;
         private readonly Logger _logger;
 
@@ -22,10 +29,11 @@ namespace NzbDrone.Core.Drive
         private readonly string _cloudRoot;
         private readonly string _localBranch;
 
-        public DriveCachingVideoFileInfoReader(IVideoFileInfoReader inner, IDriveIndex index, IDriveConfigService configService, Logger logger)
+        public DriveCachingVideoFileInfoReader(IVideoFileInfoReader inner, IDriveIndex index, IDriveClient driveClient, IDriveConfigService configService, Logger logger)
         {
             _inner = inner;
             _index = index;
+            _driveClient = driveClient;
             _configService = configService;
             _logger = logger;
 
@@ -38,11 +46,29 @@ namespace NzbDrone.Core.Drive
         public MediaInfoModel GetMediaInfo(string filename)
         {
             var entry = ResolveDriveEntry(filename);
+            return entry == null ? _inner.GetMediaInfo(filename) : GetCachedOrProbe(entry);
+        }
+
+        public TimeSpan? GetRunTime(string filename)
+        {
+            var entry = ResolveDriveEntry(filename);
             if (entry == null)
             {
-                return _inner.GetMediaInfo(filename);
+                return _inner.GetRunTime(filename);
             }
 
+            // Runtime straight from Drive metadata — no bytes read at all.
+            if (entry.VideoDurationMs is > 0)
+            {
+                return TimeSpan.FromMilliseconds(entry.VideoDurationMs.Value);
+            }
+
+            var model = GetCachedOrProbe(entry);
+            return model != null && model.RunTime > TimeSpan.Zero ? model.RunTime : (TimeSpan?)null;
+        }
+
+        private MediaInfoModel GetCachedOrProbe(DriveFileEntry entry)
+        {
             var cached = _index.GetProbe(entry.FileId);
             if (cached != null)
             {
@@ -60,7 +86,7 @@ namespace NzbDrone.Core.Drive
                 }
             }
 
-            var info = _inner.GetMediaInfo(filename);
+            var info = ProbeViaDrive(entry);
             if (info != null)
             {
                 try
@@ -76,39 +102,55 @@ namespace NzbDrone.Core.Drive
             return info;
         }
 
-        public TimeSpan? GetRunTime(string filename)
+        // FUSE-free probe: download the header (then, if needed, the whole file) via the Drive
+        // API to a temp file and ffprobe that. Returns null on failure (no FUSE fallback — the
+        // whole point is that the arrs never block on the mount).
+        private MediaInfoModel ProbeViaDrive(DriveFileEntry entry)
         {
-            var entry = ResolveDriveEntry(filename);
-            if (entry == null)
+            var temp = Path.Combine(Path.GetTempPath(), "gdrive-probe-" + Guid.NewGuid().ToString("N") + Path.GetExtension(entry.Name));
+            try
             {
-                return _inner.GetRunTime(filename);
-            }
+                using (var fs = File.Create(temp))
+                {
+                    _driveClient.DownloadPrefix(entry.FileId, HeaderBytes, fs);
+                }
 
-            // Runtime straight from Drive metadata — no byte reads at all.
-            if (entry.VideoDurationMs is > 0)
+                var model = _inner.GetMediaInfo(temp);
+
+                if (model == null || model.Width <= 0)
+                {
+                    // Header wasn't enough (e.g. mp4 with moov at the end) — pull the whole
+                    // file. Still the Drive API, still no FUSE; one-time cost, then cached.
+                    _logger.Debug("Header probe insufficient for {0}; full Drive download", entry.Path);
+                    using (var fs = File.Create(temp))
+                    {
+                        _driveClient.DownloadPrefix(entry.FileId, 0, fs);
+                    }
+
+                    model = _inner.GetMediaInfo(temp);
+                }
+
+                return model;
+            }
+            catch (Exception ex)
             {
-                return TimeSpan.FromMilliseconds(entry.VideoDurationMs.Value);
+                _logger.Warn(ex, "Drive-API mediainfo probe failed for {0}", entry.Path);
+                return null;
             }
-
-            // Else fall back to a cached probe if we have one.
-            var cached = _index.GetProbe(entry.FileId);
-            if (cached != null)
+            finally
             {
                 try
                 {
-                    var model = JsonConvert.DeserializeObject<MediaInfoModel>(cached);
-                    if (model != null && model.RunTime > TimeSpan.Zero)
+                    if (File.Exists(temp))
                     {
-                        return model.RunTime;
+                        File.Delete(temp);
                     }
                 }
                 catch
                 {
-                    // fall through to a live probe
+                    // best-effort temp cleanup
                 }
             }
-
-            return _inner.GetRunTime(filename);
         }
 
         // A Drive-backed entry iff the path is under CloudRoot, is NOT present on the local

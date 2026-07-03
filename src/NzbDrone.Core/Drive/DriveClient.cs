@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Net.Http.Headers;
 using Google.Apis.Auth.OAuth2;
 using Google.Apis.Drive.v3;
 using Google.Apis.Services;
@@ -11,6 +12,10 @@ namespace NzbDrone.Core.Drive
     public interface IDriveClient
     {
         IEnumerable<DriveRawNode> EnumerateDrive(string driveId);
+
+        // Download the first `bytes` of a file (or the whole file if bytes<=0) straight from
+        // the Drive API by file ID — NO FUSE. Used for FUSE-free mediainfo probing.
+        void DownloadPrefix(string fileId, long bytes, Stream destination);
     }
 
     public class DriveClient : IDriveClient
@@ -56,6 +61,22 @@ namespace NzbDrone.Core.Drive
                 pageToken = response.NextPageToken;
             }
             while (!string.IsNullOrEmpty(pageToken));
+        }
+
+        public void DownloadPrefix(string fileId, long bytes, Stream destination)
+        {
+            var service = GetService();
+            var request = service.Files.Get(fileId);
+            request.SupportsAllDrives = true;
+
+            if (bytes > 0)
+            {
+                request.DownloadRange(destination, new RangeHeaderValue(0, bytes - 1));
+            }
+            else
+            {
+                request.Download(destination);
+            }
         }
 
         private DriveService GetService()
