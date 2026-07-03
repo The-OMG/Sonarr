@@ -1,6 +1,7 @@
 using DryIoc;
 using NzbDrone.Common.Disk;
 using NzbDrone.Core.Drive;
+using NzbDrone.Core.MediaFiles.MediaInfo;
 
 namespace NzbDrone.Host
 {
@@ -17,6 +18,13 @@ namespace NzbDrone.Host
                 condition: factory => factory.ImplementationType == typeof(DispatchDiskProvider));
 
             container.Register<IDiskProvider, DispatchDiskProvider>(reuse: Reuse.Singleton, setup: Setup.Decorator);
+
+            // Same decorator pattern for mediainfo: cache ffprobe results by Drive file ID
+            // (probe-once) and serve runtime from Drive videoMediaMetadata.
+            container.Unregister<IVideoFileInfoReader>(
+                condition: factory => factory.ImplementationType == typeof(DriveCachingVideoFileInfoReader));
+
+            container.Register<IVideoFileInfoReader, DriveCachingVideoFileInfoReader>(reuse: Reuse.Singleton, setup: Setup.Decorator);
 
             return container;
         }
