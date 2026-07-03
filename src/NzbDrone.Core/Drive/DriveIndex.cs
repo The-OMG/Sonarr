@@ -12,9 +12,11 @@ namespace NzbDrone.Core.Drive
         void StageDrive(string driveId, IEnumerable<DriveRawNode> nodes);
         void MaterializeDrive(int rank, string driveId);
 
+        bool HasData();
         DriveFileEntry FindEntry(string relativePath);
         bool Exists(string relativePath);
         List<DriveFileEntry> ListChildren(string relativeDir);
+        List<DriveFileEntry> ListDescendants(string relativeDir);
 
         string GetProbe(string fileId);
         void SetProbe(string fileId, string json);
@@ -235,6 +237,19 @@ namespace NzbDrone.Core.Drive
                 name.Count(kvp => cache.TryGetValue(kvp.Key, out var p) && p != null));
         }
 
+        public bool HasData()
+        {
+            using var con = Connect();
+            var name = con.ExecuteScalar<string>(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='entries'");
+            if (name == null)
+            {
+                return false;
+            }
+
+            return con.ExecuteScalar<long>("SELECT COUNT(1) FROM entries") > 0;
+        }
+
         public DriveFileEntry FindEntry(string relativePath)
         {
             using var con = Connect();
@@ -261,6 +276,30 @@ namespace NzbDrone.Core.Drive
                 .GroupBy(e => e.Name)
                 .Select(g => g.First())
                 .ToList();
+        }
+
+        // All entries (files and folders) beneath relativeDir, recursively. Union merge:
+        // same relative path on multiple drives collapses to the lowest drive_rank.
+        public List<DriveFileEntry> ListDescendants(string relativeDir)
+        {
+            using var con = Connect();
+
+            var pattern = EscapeLike(relativeDir) + "/%";
+
+            return con.Query<DriveFileEntry>(
+                    $"SELECT {SelectColumns} FROM entries WHERE path LIKE @p ESCAPE '\\' ORDER BY drive_rank",
+                    new { p = pattern })
+                .GroupBy(e => e.Path)
+                .Select(g => g.First())
+                .ToList();
+        }
+
+        private static string EscapeLike(string value)
+        {
+            return value
+                .Replace("\\", "\\\\")
+                .Replace("%", "\\%")
+                .Replace("_", "\\_");
         }
 
         public string GetProbe(string fileId)
