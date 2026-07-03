@@ -17,7 +17,7 @@ namespace NzbDrone.Core.Drive
     // straight through (ffprobe on real local disk is fine and never involves FUSE).
     public class DriveCachingVideoFileInfoReader : IVideoFileInfoReader
     {
-        private const long HeaderBytes = 32L * 1024 * 1024;   // 32 MiB is enough for almost all headers
+        private const long HeaderBytes = 64L * 1024 * 1024;   // 64 MiB covers virtually all real headers
 
         private readonly IVideoFileInfoReader _inner;
         private readonly IDriveIndex _index;
@@ -102,9 +102,11 @@ namespace NzbDrone.Core.Drive
             return info;
         }
 
-        // FUSE-free probe: download the header (then, if needed, the whole file) via the Drive
-        // API to a temp file and ffprobe that. Returns null on failure (no FUSE fallback — the
-        // whole point is that the arrs never block on the mount).
+        // FUSE-free probe: pull only the file HEADER via the Drive API to a temp file and
+        // ffprobe that. Header-only by design — never download whole multi-GB files (a moov-
+        // at-end mp4 or a broken/zero-content file just yields no mediainfo, which is fine and
+        // bounded). Returns null on failure (no FUSE fallback — the arrs must never block on
+        // the mount).
         private MediaInfoModel ProbeViaDrive(DriveFileEntry entry)
         {
             var temp = Path.Combine(Path.GetTempPath(), "gdrive-probe-" + Guid.NewGuid().ToString("N") + Path.GetExtension(entry.Name));
@@ -115,22 +117,7 @@ namespace NzbDrone.Core.Drive
                     _driveClient.DownloadPrefix(entry.FileId, HeaderBytes, fs);
                 }
 
-                var model = _inner.GetMediaInfo(temp);
-
-                if (model == null || model.Width <= 0)
-                {
-                    // Header wasn't enough (e.g. mp4 with moov at the end) — pull the whole
-                    // file. Still the Drive API, still no FUSE; one-time cost, then cached.
-                    _logger.Debug("Header probe insufficient for {0}; full Drive download", entry.Path);
-                    using (var fs = File.Create(temp))
-                    {
-                        _driveClient.DownloadPrefix(entry.FileId, 0, fs);
-                    }
-
-                    model = _inner.GetMediaInfo(temp);
-                }
-
-                return model;
+                return _inner.GetMediaInfo(temp);
             }
             catch (Exception ex)
             {

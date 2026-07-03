@@ -69,13 +69,18 @@ namespace NzbDrone.Core.Drive
             var request = service.Files.Get(fileId);
             request.SupportsAllDrives = true;
 
-            if (bytes > 0)
+            // Shared drives flag lots of content as "abusive" (copyright heuristics); without
+            // this the media-download endpoint 403s and writes nothing. rclone's mount sets the
+            // same flag.
+            request.AcknowledgeAbuse = true;
+
+            var progress = bytes > 0
+                ? request.DownloadRange(destination, new RangeHeaderValue(0, bytes - 1))
+                : request.DownloadWithStatus(destination);
+
+            if (progress.Status == Google.Apis.Download.DownloadStatus.Failed)
             {
-                request.DownloadRange(destination, new RangeHeaderValue(0, bytes - 1));
-            }
-            else
-            {
-                request.Download(destination);
+                throw progress.Exception ?? new InvalidOperationException($"Drive download failed for {fileId}");
             }
         }
 
