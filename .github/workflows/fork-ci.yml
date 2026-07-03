@@ -1,0 +1,45 @@
+name: fork-ci
+
+# CI for the gdrive-native fork: verify the Drive backend still builds on every push,
+# and once a week check whether the branch still rebases cleanly onto the latest upstream
+# stable tag (early warning for the next sync-upstream.sh run).
+on:
+  push:
+    branches: [gdrive-native]
+  pull_request:
+    branches: [gdrive-native]
+  schedule:
+    - cron: '0 6 * * 1'   # Mondays 06:00 UTC
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+      - name: Build solution (Drive backend + StyleCop)
+        run: dotnet build src/Sonarr.sln -c Release -nodeReuse:false
+
+  upstream-drift:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+      - name: Rebase onto latest upstream stable tag and build
+        run: |
+          git config user.email ci@example.com
+          git config user.name ci
+          git remote add upstream https://github.com/Sonarr/Sonarr.git
+          git fetch --tags upstream
+          TAG=$(git tag -l 'v*' --sort=-v:refname | grep -E '^v4\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
+          echo "Latest upstream stable tag: $TAG"
+          git rebase "$TAG" || { echo "::error::gdrive-native no longer rebases cleanly onto $TAG"; exit 1; }
+          dotnet build src/Sonarr.sln -c Release -nodeReuse:false
