@@ -26,7 +26,7 @@ namespace NzbDrone.Core.Drive
     {
         private const string SelectColumns =
             "file_id AS FileId, drive_id AS DriveId, drive_rank AS DriveRank, parent_id AS ParentId, " +
-            "name AS Name, path AS Path, dir AS Dir, is_dir AS IsDirectory, size AS Size, md5 AS Md5, " +
+            "name AS Name, path AS Path, is_dir AS IsDirectory, size AS Size, md5 AS Md5, " +
             "modified AS ModifiedRaw, vmm_w AS VideoWidth, vmm_h AS VideoHeight, vmm_dur AS VideoDurationMs, " +
             "shortcut_target AS ShortcutTargetId";
 
@@ -58,10 +58,10 @@ namespace NzbDrone.Core.Drive
                 PRIMARY KEY(drive_id, id));");
             con.Execute(@"CREATE TABLE IF NOT EXISTS entries(
                 file_id TEXT PRIMARY KEY, drive_id TEXT, drive_rank INTEGER, parent_id TEXT, name TEXT,
-                path TEXT, dir TEXT, is_dir INTEGER, size INTEGER, md5 TEXT, modified TEXT,
+                path TEXT, is_dir INTEGER, size INTEGER, md5 TEXT, modified TEXT,
                 vmm_w INTEGER, vmm_h INTEGER, vmm_dur INTEGER, shortcut_target TEXT);");
             con.Execute("CREATE INDEX IF NOT EXISTS idx_entries_path ON entries(path);");
-            con.Execute("CREATE INDEX IF NOT EXISTS idx_entries_dir ON entries(dir);");
+            con.Execute("CREATE INDEX IF NOT EXISTS idx_entries_parent ON entries(parent_id);");
             con.Execute(@"CREATE TABLE IF NOT EXISTS probe_cache(file_id TEXT PRIMARY KEY, json TEXT);");
         }
 
@@ -168,14 +168,16 @@ namespace NzbDrone.Core.Drive
             using var readRaw = Connect();
             using var tx = writeCon.BeginTransaction();
             using var ins = new SQLiteCommand(
-                "INSERT OR IGNORE INTO entries VALUES(@fid,@did,@rk,@pid,@nm,@pt,@dir,@isdir,@sz,@md5,@mod,@w,@h,@dur,@st)", writeCon, tx);
+                "INSERT OR IGNORE INTO entries (file_id,drive_id,drive_rank,parent_id,name,path,is_dir,size,md5,modified,vmm_w,vmm_h,vmm_dur,shortcut_target) " +
+                "VALUES(@fid,@did,@rk,@pid,@nm,@pt,@isdir,@sz,@md5,@mod,@w,@h,@dur,@st)",
+                writeCon,
+                tx);
             var pFid = ins.Parameters.Add("@fid", System.Data.DbType.String);
             var pDid = ins.Parameters.Add("@did", System.Data.DbType.String);
             var pRk = ins.Parameters.Add("@rk", System.Data.DbType.Int32);
             var pPid = ins.Parameters.Add("@pid", System.Data.DbType.String);
             var pNm = ins.Parameters.Add("@nm", System.Data.DbType.String);
             var pPt = ins.Parameters.Add("@pt", System.Data.DbType.String);
-            var pDir = ins.Parameters.Add("@dir", System.Data.DbType.String);
             var pIsDir = ins.Parameters.Add("@isdir", System.Data.DbType.Int32);
             var pSz = ins.Parameters.Add("@sz", System.Data.DbType.Int64);
             var pMd5 = ins.Parameters.Add("@md5", System.Data.DbType.String);
@@ -209,13 +211,10 @@ namespace NzbDrone.Core.Drive
                         continue;
                     }
 
-                    var slash = path.LastIndexOf('/');
-
                     pFid.Value = id;
                     pPid.Value = reader.IsDBNull(1) ? (object)System.DBNull.Value : reader.GetString(1);
                     pNm.Value = reader.GetString(2);
                     pPt.Value = path;
-                    pDir.Value = slash < 0 ? string.Empty : path.Substring(0, slash);
                     pIsDir.Value = mime == DriveMime.Folder ? 1 : 0;
                     pSz.Value = reader.IsDBNull(4) ? 0L : reader.GetInt64(4);
                     pMd5.Value = reader.IsDBNull(5) ? (object)System.DBNull.Value : reader.GetString(5);
@@ -268,10 +267,13 @@ namespace NzbDrone.Core.Drive
         {
             using var con = Connect();
 
-            // Union merge: when the same relative name exists on multiple drives, the
-            // lowest drive_rank wins (rclone union search_policy=ff).
+            // Children = entries whose parent is the folder(s) at relativeDir. The same folder
+            // path can exist on multiple drives (union), so match all of them by parent_id.
+            // Union merge: when the same child name exists on multiple drives, the lowest
+            // drive_rank wins (rclone union search_policy=ff).
             return con.Query<DriveFileEntry>(
-                    $"SELECT {SelectColumns} FROM entries WHERE dir=@d ORDER BY drive_rank",
+                    $"SELECT {SelectColumns} FROM entries WHERE parent_id IN " +
+                    "(SELECT file_id FROM entries WHERE path=@d AND is_dir=1) ORDER BY drive_rank",
                     new { d = relativeDir })
                 .GroupBy(e => e.Name)
                 .Select(g => g.First())

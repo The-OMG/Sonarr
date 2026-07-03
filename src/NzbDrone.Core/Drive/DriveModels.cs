@@ -33,9 +33,6 @@ namespace NzbDrone.Core.Drive
         // Cloud-root-relative, '/'-joined, no leading/trailing slash.
         public string Path { get; set; }
 
-        // Parent directory of Path ("" for a top-level entry). Indexed for fast listing.
-        public string Dir { get; set; }
-
         public bool IsDirectory { get; set; }
         public long Size { get; set; }
         public string Md5 { get; set; }
